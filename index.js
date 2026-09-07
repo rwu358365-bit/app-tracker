@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "ruirui2026";
 
 // ── JSON 存储 ──
-const DATA_DIR = existsSync("/data") ? "/data" : "./data";
+const DATA_DIR = "./data";
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 const DB_FILE = `${DATA_DIR}/apps.json`;
 
