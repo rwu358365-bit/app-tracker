@@ -60,6 +60,23 @@ function handleTool(name, args) {
   return "未知工具";
 }
 
+function handleJsonRpc(msg) {
+  if (msg.method === "initialize") {
+    return { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "app-tracker", version: "1.0.0" } } };
+  } else if (msg.method === "notifications/initialized") {
+    return null;
+  } else if (msg.method === "tools/list") {
+    return { jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS } };
+  } else if (msg.method === "tools/call") {
+    var text = handleTool(msg.params?.name, msg.params?.arguments);
+    return { jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: text }] } };
+  } else if (msg.method === "ping") {
+    return { jsonrpc: "2.0", id: msg.id, result: {} };
+  } else {
+    return { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } };
+  }
+}
+
 // ── Express ──
 const app = express();
 app.use(express.json());
@@ -72,18 +89,16 @@ function authCheck(req, res, next) {
   next();
 }
 
-// ── OAuth 2.0 (给Claude连接器用) ──
+// ── OAuth 2.0 ──
 const oauthCodes = new Map();
 const oauthTokens = new Set();
 
-// 动态获取 base URL
 function getBaseUrl(req) {
   const proto = req.headers["x-forwarded-proto"] || req.protocol;
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   return proto + "://" + host;
 }
 
-// OAuth 元数据发现
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   const base = getBaseUrl(req);
   res.json({
@@ -98,7 +113,6 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
   });
 });
 
-// 动态客户端注册
 app.post("/oauth/register", (req, res) => {
   const clientId = "client_" + crypto.randomUUID();
   const clientSecret = "secret_" + crypto.randomUUID();
@@ -113,35 +127,21 @@ app.post("/oauth/register", (req, res) => {
   });
 });
 
-// 授权端点 - 自动批准并重定向
 app.get("/oauth/authorize", (req, res) => {
   const { redirect_uri, state, code_challenge, code_challenge_method, client_id } = req.query;
   const code = "code_" + crypto.randomUUID();
-  oauthCodes.set(code, {
-    redirect_uri,
-    client_id,
-    code_challenge,
-    code_challenge_method,
-    created: Date.now(),
-  });
-  // 自动批准，直接重定向
+  oauthCodes.set(code, { redirect_uri, client_id, code_challenge, code_challenge_method, created: Date.now() });
   const url = redirect_uri + "?code=" + encodeURIComponent(code) + (state ? "&state=" + encodeURIComponent(state) : "");
   res.redirect(302, url);
 });
 
-// Token 端点
 app.post("/oauth/token", (req, res) => {
   const grantType = req.body.grant_type;
-
   if (grantType === "authorization_code") {
     const code = req.body.code;
     const stored = oauthCodes.get(code);
-    if (!stored) {
-      return res.status(400).json({ error: "invalid_grant" });
-    }
+    if (!stored) return res.status(400).json({ error: "invalid_grant" });
     oauthCodes.delete(code);
-
-    // PKCE 验证
     if (stored.code_challenge && req.body.code_verifier) {
       let computed;
       if (stored.code_challenge_method === "S256") {
@@ -149,30 +149,16 @@ app.post("/oauth/token", (req, res) => {
       } else {
         computed = req.body.code_verifier;
       }
-      if (computed !== stored.code_challenge) {
-        return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
-      }
+      if (computed !== stored.code_challenge) return res.status(400).json({ error: "invalid_grant" });
     }
-
     const accessToken = "at_" + crypto.randomUUID();
     const refreshToken = "rt_" + crypto.randomUUID();
     oauthTokens.add(accessToken);
-
-    res.json({
-      access_token: accessToken,
-      token_type: "Bearer",
-      expires_in: 86400,
-      refresh_token: refreshToken,
-    });
+    res.json({ access_token: accessToken, token_type: "Bearer", expires_in: 86400, refresh_token: refreshToken });
   } else if (grantType === "refresh_token") {
     const accessToken = "at_" + crypto.randomUUID();
     oauthTokens.add(accessToken);
-    res.json({
-      access_token: accessToken,
-      token_type: "Bearer",
-      expires_in: 86400,
-      refresh_token: req.body.refresh_token,
-    });
+    res.json({ access_token: accessToken, token_type: "Bearer", expires_in: 86400, refresh_token: req.body.refresh_token });
   } else {
     res.status(400).json({ error: "unsupported_grant_type" });
   }
@@ -192,7 +178,26 @@ app.get("/", (req, res) => {
   res.json({ status: "running", name: "瑞瑞的App记录器 🐷" });
 });
 
-// ── MCP SSE ──
+// ── MCP: Streamable HTTP (POST /mcp) ──
+app.post("/mcp", (req, res) => {
+  const msg = req.body;
+
+  // 处理通知（无id的消息）
+  if (!msg.id && msg.method) {
+    res.status(202).end();
+    return;
+  }
+
+  const response = handleJsonRpc(msg);
+  if (response) {
+    res.setHeader("Content-Type", "application/json");
+    res.json(response);
+  } else {
+    res.status(202).end();
+  }
+});
+
+// ── MCP: SSE transport (GET /mcp) ──
 const sessions = new Map();
 
 app.get("/mcp", (req, res) => {
@@ -219,22 +224,7 @@ app.post("/mcp/message", (req, res) => {
   const session = sessions.get(sessionId);
   if (!session) return res.status(404).json({ error: "session not found" });
   const msg = req.body;
-  var response = null;
-  if (msg.method === "initialize") {
-    response = { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "app-tracker", version: "1.0.0" } } };
-  } else if (msg.method === "notifications/initialized") {
-    res.status(202).end();
-    return;
-  } else if (msg.method === "tools/list") {
-    response = { jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS } };
-  } else if (msg.method === "tools/call") {
-    var text = handleTool(msg.params?.name, msg.params?.arguments);
-    response = { jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: text }] } };
-  } else if (msg.method === "ping") {
-    response = { jsonrpc: "2.0", id: msg.id, result: {} };
-  } else {
-    response = { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } };
-  }
+  const response = handleJsonRpc(msg);
   if (response) session.send("message", response);
   res.status(202).end();
 });
