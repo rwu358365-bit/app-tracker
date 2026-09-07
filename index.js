@@ -4,7 +4,7 @@ import crypto from "crypto";
 const PORT = process.env.PORT || 8080;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "ruirui2026";
 
-// ── 内存存储（重启会清空，但不会有权限问题） ──
+// ── 内存存储 ──
 let logs = [];
 
 function addLog(appName) {
@@ -64,6 +64,7 @@ function handleTool(name, args) {
 const app = express();
 app.use(express.json());
 app.use(express.text());
+app.use(express.urlencoded({ extended: true }));
 
 function authCheck(req, res, next) {
   const token = req.headers["x-token"] || req.query.token;
@@ -71,6 +72,113 @@ function authCheck(req, res, next) {
   next();
 }
 
+// ── OAuth 2.0 (给Claude连接器用) ──
+const oauthCodes = new Map();
+const oauthTokens = new Set();
+
+// 动态获取 base URL
+function getBaseUrl(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol;
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  return proto + "://" + host;
+}
+
+// OAuth 元数据发现
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  const base = getBaseUrl(req);
+  res.json({
+    issuer: base,
+    authorization_endpoint: base + "/oauth/authorize",
+    token_endpoint: base + "/oauth/token",
+    registration_endpoint: base + "/oauth/register",
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"],
+    code_challenge_methods_supported: ["S256", "plain"],
+  });
+});
+
+// 动态客户端注册
+app.post("/oauth/register", (req, res) => {
+  const clientId = "client_" + crypto.randomUUID();
+  const clientSecret = "secret_" + crypto.randomUUID();
+  res.status(201).json({
+    client_id: clientId,
+    client_secret: clientSecret,
+    redirect_uris: req.body.redirect_uris || [],
+    client_name: req.body.client_name || "Claude",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: req.body.token_endpoint_auth_method || "client_secret_post",
+  });
+});
+
+// 授权端点 - 自动批准并重定向
+app.get("/oauth/authorize", (req, res) => {
+  const { redirect_uri, state, code_challenge, code_challenge_method, client_id } = req.query;
+  const code = "code_" + crypto.randomUUID();
+  oauthCodes.set(code, {
+    redirect_uri,
+    client_id,
+    code_challenge,
+    code_challenge_method,
+    created: Date.now(),
+  });
+  // 自动批准，直接重定向
+  const url = redirect_uri + "?code=" + encodeURIComponent(code) + (state ? "&state=" + encodeURIComponent(state) : "");
+  res.redirect(302, url);
+});
+
+// Token 端点
+app.post("/oauth/token", (req, res) => {
+  const grantType = req.body.grant_type;
+
+  if (grantType === "authorization_code") {
+    const code = req.body.code;
+    const stored = oauthCodes.get(code);
+    if (!stored) {
+      return res.status(400).json({ error: "invalid_grant" });
+    }
+    oauthCodes.delete(code);
+
+    // PKCE 验证
+    if (stored.code_challenge && req.body.code_verifier) {
+      let computed;
+      if (stored.code_challenge_method === "S256") {
+        computed = crypto.createHash("sha256").update(req.body.code_verifier).digest("base64url");
+      } else {
+        computed = req.body.code_verifier;
+      }
+      if (computed !== stored.code_challenge) {
+        return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
+      }
+    }
+
+    const accessToken = "at_" + crypto.randomUUID();
+    const refreshToken = "rt_" + crypto.randomUUID();
+    oauthTokens.add(accessToken);
+
+    res.json({
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: 86400,
+      refresh_token: refreshToken,
+    });
+  } else if (grantType === "refresh_token") {
+    const accessToken = "at_" + crypto.randomUUID();
+    oauthTokens.add(accessToken);
+    res.json({
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: 86400,
+      refresh_token: req.body.refresh_token,
+    });
+  } else {
+    res.status(400).json({ error: "unsupported_grant_type" });
+  }
+});
+
+// ── iOS 快捷指令 ──
 app.post("/api/log", authCheck, (req, res) => {
   let appName;
   if (typeof req.body === "string") appName = req.body.trim();
